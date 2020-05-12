@@ -3,18 +3,26 @@ import logging
 import os
 import sys
 from datetime import datetime
+from urllib.parse import urlparse
 
 from daphne.cli import ASGI3Middleware
 from daphne.endpoints import build_endpoint_description_strings
 from daphne.server import Server
 from django.apps import apps
 from django.conf import settings
-from django.contrib.staticfiles.handlers import ASGIStaticFilesHandler
+from django.contrib.staticfiles.handlers import (
+    ASGIStaticFilesHandler as DjangoASGIStaticFilesHandler,
+)
+from django.contrib.staticfiles.handlers import (
+    StaticFilesHandlerMixin as DjangoStaticFilesHandlerMixin,
+)
 from django.contrib.staticfiles.management.commands import runserver
 from django.core.asgi import get_asgi_application
 from django.core.exceptions import ImproperlyConfigured
+from django.core.handlers.exception import response_for_exception
 from django.core.management import CommandError
 from django.core.servers.basehttp import run
+from django.http import Http404
 from django.utils import autoreload
 from django.utils.module_loading import import_string
 
@@ -47,6 +55,18 @@ def get_internal_asgi_application():
             "ASGI application '%s' could not be loaded; "
             "Error importing module." % app_path
         ) from err
+
+
+class StaticFilesHandlerMixin(DjangoStaticFilesHandlerMixin):
+    async def get_response_async(self, request):
+        try:
+            return self.serve(request)
+        except Http404 as e:
+            return response_for_exception(request, e)
+
+
+class ASGIStaticFilesHandler(StaticFilesHandlerMixin, DjangoASGIStaticFilesHandler):
+    pass
 
 
 class Command(runserver.Command):
