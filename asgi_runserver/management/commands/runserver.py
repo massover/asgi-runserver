@@ -5,6 +5,7 @@ import sys
 from datetime import datetime
 from urllib.parse import urlparse
 
+from asgiref.sync import sync_to_async
 from daphne.cli import ASGI3Middleware
 from daphne.endpoints import build_endpoint_description_strings
 from daphne.server import Server
@@ -60,7 +61,7 @@ def get_internal_asgi_application():
 class StaticFilesHandlerMixin(DjangoStaticFilesHandlerMixin):
     async def get_response_async(self, request):
         try:
-            return self.serve(request)
+            return await sync_to_async(self.serve)(request)
         except Http404 as e:
             return response_for_exception(request, e)
 
