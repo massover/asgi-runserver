@@ -1,9 +1,7 @@
 import errno
-import logging
 import os
 import sys
 from datetime import datetime
-from urllib.parse import urlparse
 
 from asgiref.sync import sync_to_async
 from daphne.cli import ASGI3Middleware
@@ -22,12 +20,10 @@ from django.core.asgi import get_asgi_application
 from django.core.exceptions import ImproperlyConfigured
 from django.core.handlers.exception import response_for_exception
 from django.core.management import CommandError
-from django.core.servers.basehttp import run
+from django.core.servers.basehttp import logger, run
 from django.http import Http404
 from django.utils import autoreload
 from django.utils.module_loading import import_string
-
-logger = logging.getLogger("django.server")
 
 
 def get_internal_asgi_application():
@@ -73,6 +69,7 @@ class ASGIStaticFilesHandler(StaticFilesHandlerMixin, DjangoASGIStaticFilesHandl
 class Command(runserver.Command):
     protocol = "http"
     http_timeout = None
+    server_type = "WSGI"
 
     def add_arguments(self, parser):
         super().add_arguments(parser)
@@ -95,17 +92,24 @@ class Command(runserver.Command):
     def handle(self, *args, **options):
         self.http_timeout = options.get("http_timeout", self.http_timeout)
 
-        if options["asgi"] and not hasattr(settings, "ASGI_APPLICATION"):
-            raise CommandError(
-                "You have not set ASGI_APPLICATION, which is needed to run the server."
-            )
+        if options["asgi"]:
+            if not hasattr(settings, "ASGI_APPLICATION"):
+                raise CommandError(
+                    "You have not set ASGI_APPLICATION, which is needed to run the server."
+                )
+            self.server_type = "ASGI"
+
         super().handle(*args, **options)
 
     def inner_run(self, *args, **options):
         # If an exception was silenced in ManagementUtility.execute in order
         # to be raised in the child process, raise it now.
         autoreload.raise_last_exception()
+
+        # 'shutdown_message' is a stealth option.
+        shutdown_message = options.get("shutdown_message", "")
         quit_command = "CTRL-BREAK" if sys.platform == "win32" else "CONTROL-C"
+
         self.stdout.write("Performing system checks...\n\n")
         self.check(display_num_errors=True)
         # Need to check migrations here, so can't use the
@@ -113,12 +117,6 @@ class Command(runserver.Command):
         self.check_migrations()
         now = datetime.now().strftime("%B %d, %Y - %X")
         self.stdout.write(now)
-        if options["asgi"]:
-            server_type = "ASGI"
-            run_fn = self.run_asgi
-        else:
-            server_type = "WSGI"
-            run_fn = self.run_wsgi
         self.stdout.write(
             (
                 "Django version %(version)s, using settings %(settings)r\n"
@@ -128,29 +126,19 @@ class Command(runserver.Command):
             % {
                 "version": self.get_version(),
                 "settings": settings.SETTINGS_MODULE,
-                "server_type": server_type,
+                "server_type": self.server_type,
                 "protocol": self.protocol,
                 "addr": "[%s]" % self.addr if self._raw_ipv6 else self.addr,
                 "port": self.port,
                 "quit_command": quit_command,
             }
         )
-        run_fn(*args, **options)
 
-    def run_wsgi(self, *args, **options):
-        threading = options["use_threading"]
-        # 'shutdown_message' is a stealth option.
-        shutdown_message = options.get("shutdown_message", "")
         try:
-            handler = self.get_handler(*args, **options)
-            run(
-                self.addr,
-                int(self.port),
-                handler,
-                ipv6=self.use_ipv6,
-                threading=threading,
-                server_cls=self.server_cls,
-            )
+            if options["asgi"]:
+                self.run_asgi(*args, **options)
+            else:
+                self.run_wsgi(*args, **options)
         except OSError as e:
             # Use helpful error messages instead of ugly tracebacks.
             ERRORS = {
@@ -170,6 +158,18 @@ class Command(runserver.Command):
                 self.stdout.write(shutdown_message)
             sys.exit(0)
 
+    def run_wsgi(self, *args, **options):
+        threading = options["use_threading"]
+        handler = self.get_handler(*args, **options)
+        run(
+            self.addr,
+            int(self.port),
+            handler,
+            ipv6=self.use_ipv6,
+            threading=threading,
+            server_cls=self.server_cls,
+        )
+
     def run_asgi(self, *args, **options):
         # Launch server in 'main' thread. Signals are disabled as it's still
         # actually a subthread under the autoreloader.
@@ -177,21 +177,15 @@ class Command(runserver.Command):
 
         # build the endpoint description string from host/port options
         endpoints = build_endpoint_description_strings(host=self.addr, port=self.port)
-        try:
-            Server(
-                application=self.get_handler(**options),
-                endpoints=endpoints,
-                signal_handlers=not options["use_reloader"],
-                action_logger=self.log_action,
-                http_timeout=self.http_timeout,
-                root_path=getattr(settings, "FORCE_SCRIPT_NAME", "") or "",
-            ).run()
-            logger.debug("Daphne exited")
-        except KeyboardInterrupt:
-            shutdown_message = options.get("shutdown_message", "")
-            if shutdown_message:
-                self.stdout.write(shutdown_message)
-            return
+        Server(
+            application=self.get_handler(**options),
+            endpoints=endpoints,
+            signal_handlers=not options["use_reloader"],
+            action_logger=self.log_action,
+            http_timeout=self.http_timeout,
+            root_path=getattr(settings, "FORCE_SCRIPT_NAME", "") or "",
+        ).run()
+        logger.debug("Daphne exited")
 
     def get_handler(self, *args, **options):
         """
